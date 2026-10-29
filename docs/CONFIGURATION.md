@@ -57,6 +57,12 @@ Notes:
 Used when a request does not set them: `max_tokens` (`1024`), `temperature` (`0.7`; `0` = greedy), `top_p`
 (`0.8`), `top_k` (`20`). These are the model publisher's recommended non-thinking settings.
 
+`thinking_budget` (`0` = no limit) caps the thinking of a request that turns thinking on and sets no
+`thinking_budget_tokens` of its own. At the budget, the server closes the thinking and the model gives its answer.
+Set it for clients that can turn thinking on but cannot send a budget, for example pi with
+`thinkingFormat: "qwen-chat-template"`. Without a budget, the 27B can think until it reaches `max_tokens` and give no
+answer.
+
 ## Environment variables for the engine
 
 These variables have no config key. Use them to test or to compare.

@@ -30,6 +30,7 @@ DEFAULTS = {
     "checkpoint_budget_mb": "0",        # host RAM for checkpoints and parked conversations (0: 20% of the RAM)
     "repeat_stop": "0",                 # 1: stop a reply caught in a repeating loop (close it while thinking)
     "reasoning_effort": "",             # 27B template: xhigh | medium | low (empty: the template default, xhigh)
+    "thinking_budget": "0",             # thinking tokens before the server closes the thinking (0: no limit); a request's thinking_budget_tokens wins
     # generation defaults (a request's own values win)
     "max_tokens": "1024",
     "temperature": "0.7",
@@ -38,7 +39,7 @@ DEFAULTS = {
 }
 
 INT_KEYS = {"repeat_stop", "port", "ctx", "fast_clusters", "checkpoint_every", "checkpoint_budget_mb", "prefix_max", "prefix_min", "park_max",
-            "max_tokens", "top_k"}
+            "max_tokens", "top_k", "thinking_budget"}
 FLOAT_KEYS = {"temperature", "top_p"}
 PATH_KEYS = {"pack", "state_dir"}
 
