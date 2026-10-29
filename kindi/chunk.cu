@@ -119,6 +119,7 @@ extern "C" __global__ void __launch_bounds__(256) k_mm_g5n(const uint4* __restri
   __shared__ MMShared S;
   const int t = threadIdx.x, tx = t & 15, ty = t >> 4;
   const int r0 = blockIdx.x * MM_BR, t0 = blockIdx.y * MM_BT, NT16 = R >> 4, m0 = r0 >> 4;
+  if(t0 >= T) return;   /* a token tile past the chunk's T tokens (the grid is planned for a full chunk): no output */
   const int g_lo = (int)((long long)blockIdx.z * NG / gridDim.z), g_hi = (int)((long long)(blockIdx.z + 1) * NG / gridDim.z);
   float acc[8][8];
 #pragma unroll
@@ -178,6 +179,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) k_mm_g5p(const uint4* __res
   __shared__ MMShared S;
   const int t = threadIdx.x, tx = t & 15, ty = t >> 4;
   const int r0 = blockIdx.x * MM_BR, t0 = blockIdx.y * MM_BT, NT16 = R >> 4, m0 = r0 >> 4;
+  if(t0 >= T) return;   /* a token tile past the chunk's T tokens (the grid is planned for a full chunk): no output */
   const int g_lo = (int)((long long)blockIdx.z * NG / gridDim.z), g_hi = (int)((long long)(blockIdx.z + 1) * NG / gridDim.z);
   float acc[8][8];
 #pragma unroll
@@ -860,6 +862,7 @@ extern "C" __global__ void __launch_bounds__(256, 1) k_mm_g5q(const uint4* __res
   __shared__ MQShared S;
   const int t = threadIdx.x, tx = t & 15, ty = t >> 4;
   const int r0 = blockIdx.x * MM_BR, t0 = blockIdx.y * MM_BT, NT16 = R >> 4, m0 = r0 >> 4;
+  if(t0 >= T) return;   /* a token tile past the chunk's T tokens (the grid is planned for a full chunk): no output */
   float acc[8][8];
 #pragma unroll
   for(int i = 0; i < 8; ++i)

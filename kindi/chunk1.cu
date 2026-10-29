@@ -47,6 +47,7 @@ extern "C" __global__ void __launch_bounds__(256) k_mm_g4(const unsigned char* _
   __shared__ MMShared S;
   const int t = threadIdx.x, tx = t & 15, ty = t >> 4;
   const int r0 = blockIdx.x * MM_BR, t0 = blockIdx.y * MM_BT, NPH = C >> 9, NB = C >> 7;
+  if(t0 >= T) return;   /* a token tile past the chunk's T tokens (the grid is planned for a full chunk): no output */
   const int b_lo = (int)((long long)blockIdx.z * NB / gridDim.z), b_hi = (int)((long long)(blockIdx.z + 1) * NB / gridDim.z);
   float acc[8][8];
 #pragma unroll
@@ -320,6 +321,7 @@ extern "C" __global__ void __launch_bounds__(256) k_mm_g4s(const unsigned char* 
   __shared__ MSShared S;
   const int t = threadIdx.x, tx = t & 15, ty = t >> 4;
   const int r0 = blockIdx.x * MS_B, t0 = blockIdx.y * MS_B, NPH = C >> 9, NB = C >> 7;
+  if(t0 >= T) return;   /* a token tile past the chunk's T tokens (the grid is planned for a full chunk): no output */
   const int b_lo = (int)((long long)blockIdx.z * NB / gridDim.z), b_hi = (int)((long long)(blockIdx.z + 1) * NB / gridDim.z);
   float acc[4][4];
 #pragma unroll
@@ -405,6 +407,7 @@ __device__ __forceinline__ void kep3_core(const unsigned char* __restrict__ Wb, 
   __shared__ uint4 raw[32 * (BK / 16)];
   const int t = threadIdx.x, tx = t & 15, ty = t >> 4;
   const int r0 = blockIdx.x * KB_R, t0 = blockIdx.y * KB_T, NPH = C >> 9, NB = C >> 7;
+  if(t0 >= T) return;   /* a token tile past the chunk's T tokens (the grid is planned for a full chunk): no output */
   const int b_lo = (int)((long long)blockIdx.z * NB / gridDim.z), b_hi = (int)((long long)(blockIdx.z + 1) * NB / gridDim.z);
   const int NL = BK / 16;                      /* lanes (16-column words) per step */
   float acc[4][8];
