@@ -83,3 +83,21 @@ docker run -d --name kindi-2 --restart unless-stopped --gpus all -u $(id -u):$(i
 ```
 
 Options go in as environment variables (`-e KINDI_CTX=16384`) or in `/data/kindi.conf`.
+
+## Windows (Docker Desktop)
+
+The NVIDIA image runs under Docker Desktop with the WSL2 engine; the Windows driver is enough (no Container Toolkit
+to install). Tested on Windows 10 with a GeForce GTX TITAN X ([CARDS.md](CARDS.md)).
+
+- Mount a Windows folder as `/data` with a forward-slash drive path, and leave out `-u`:
+
+  ```powershell
+  docker run --rm --gpus all -v D:/kindi:/data kindi:0.3.0 verify
+  ```
+
+- In Git Bash, set `MSYS_NO_PATHCONV=1` first. Otherwise Git Bash rewrites the container paths: `-e KINDI_PACK=/data/pack`
+  arrives as `C:/Program Files/Git/data/pack`.
+- Docker Desktop's Linux VM gets half of the computer's memory by default. The first load of the 27B needs up to
+  ~14 GB of it; raise the limit with `memory=` under `[wsl2]` in `%UserProfile%\.wslconfig` if the load fails.
+- Under Windows (WDDM), keep about 2 GB of the card's memory free: a context fitted to the last few hundred MB made
+  prompt reading 2.8 times slower on the TITAN X. Set `KINDI_CTX` (or raise `KINDI_MEM_RESERVE_MB`) accordingly.

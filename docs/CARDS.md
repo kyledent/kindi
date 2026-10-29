@@ -80,6 +80,27 @@ Replace `...` with the variables in the section for your card. To use one card o
 - Nemotron also runs on this card (experimental): 20.1 tokens/s of generation at 512 tokens. The installer does not
   offer it on Kepler cards.
 
+## GeForce GTX TITAN X, 12 GB (Maxwell, sm_52)
+
+Measured on Windows 10 with Docker Desktop (WSL2), driver 582.28, the card also driving the desktop, Kindi 0.3.0.
+
+| item | value |
+|---|---|
+| model | Ternary-Bonsai-2-27B (`kindi verify` ALL PASS; the 2B also passes) |
+| variables | `KINDI_PACK=/data/pack27b`, `KINDI_CARDS=1`, `KINDI_CTX=65536`, `KINDI_HEAD=exact`, `KINDI_REPEAT_STOP=1`, `KINDI_MAX_TOKENS=65536`, `KINDI_BLOCKING_SYNC=0` |
+| generation | 22.7 tokens/s at 100 tokens, 21.1 at 8K, 18.8 at 24K, 17.3 at 32K, 14.0 at 60K (median of three `kindi bench` passes) |
+| prompt reading | 68.5 tokens/s at 0 (a 256-token chunk), 52.8 at 8K, 49.2 at 16K, 43.3 at 32K |
+| context | 119,040 tokens fit with `KINDI_MEM_RESERVE_MB=512` next to a desktop that takes ~1.8 GB; see below |
+
+- The card runs the K1200 paths: 2-bit weights, fp32 chunk products (no dp4a below sm_61). `KINDI_G5=1` (5-trit
+  weights) works and passes `verify` on this card, but generation is 18% slower (18.6 against 22.7 tokens/s), as on
+  Kepler.
+- **Leave about 2 GB of card memory free on Windows.** With the context fitted to 119,040 tokens (~220 MiB free), a
+  server read new prompt text 2.8 times slower than with `KINDI_CTX=65536` (~2 GB free): 984 tokens in 52.4 s against
+  18.9 s, and a 6,700-token opening at 28 against 56 tokens/s. The engine speeds above were measured with ~2 GB free.
+  A monitor on another graphics adapter (for example the CPU's) frees the desktop's part of the card.
+- Every start lays out the 2-bit weights again: about 4-6 minutes with the pack on a Windows drive.
+
 ## GeForce GTX 1080, 8 GB (Pascal, sm_61)
 
 | item | value |
