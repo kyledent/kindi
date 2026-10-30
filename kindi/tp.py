@@ -483,6 +483,16 @@ class Shard(object):
                 a.fill(0)
 
     # ------------------------------------------------------------------ the plan
+    def scores_kernel(self):
+        """(kernel, grid, block) of the decode attention scores: dp4a (k_attn_sq8d) where it is on, else two threads
+        per position and two positions per pair (k_attn_sq8p: whole-sector K loads, each query value read once for
+        two positions; the same scores as k_attn_sq8t, a thread per position, which KINDI_ATT_PAIR=0 keeps)"""
+        if self.dp4a:
+            return self.k.k_attn_sq8d, (self.NHKV, (self.ctx + 255) // 256), (256,)
+        if os.environ.get("KINDI_ATT_PAIR", "1") == "1":
+            return self.k.k_attn_sq8p, (self.NHKV, (self.ctx + 255) // 256), (256,)
+        return self.k.k_attn_sq8t, (self.NHKV, (self.ctx + 255) // 256), (256,)
+
     def build_plans(self):
         s, tp, K = self, self.tp, self.k
         D, HB, HK, HD = s.D, s.HB, s.HK, s.HD
@@ -616,7 +626,7 @@ class Shard(object):
                                                      Dyn("pos", s.Vd[kvi].data.ptr, nblk * 2, ptr=True), i32(nblk)))
             P.add(K.k_q8row, ((NH * HD + 1023) // 1024,), (1024,), (s.qr, s.qq, s.qd, i32(NH * HD // 32)))
             n = lambda: Dyn("pos", 1, 1)  # noqa: E731
-            P.add(K.k_attn_sq8d if s.dp4a else K.k_attn_sq8t, (NHKV, (s.ctx + 255) // 256), (256,), (s.Kq[kvi], s.Kd[kvi], s.qq, s.qd, s.sbuf, n(), i32(NHKV), i32(s.G)))
+            P.add(*s.scores_kernel(), (s.Kq[kvi], s.Kd[kvi], s.qq, s.qd, s.sbuf, n(), i32(NHKV), i32(s.G)))
             P.add(K.k_softmax_rows, (NH,), (256,), (s.sbuf, n()))
             P.add(K.k_attn_vq8w, (NHKV, 1, (s.ctx + 255) // 256), (128,), (s.sbuf, s.Vq[kvi], s.Vd[kvi], s.apart, n(),
                                                                          i32(NH), i32(NHKV), i32(s.G)))
@@ -1104,8 +1114,7 @@ def build_batch_plan(s, NB):
                 continue
             n = lambda: Dyn("pos", 1 + k, 1)  # noqa: E731
             P.add(K.k_q8row, ((NH * HD + 1023) // 1024,), (1024,), (s.qr, s.qq, s.qd, i32(NH * HD // 32)))
-            P.add(K.k_attn_sq8d if s.dp4a else K.k_attn_sq8t, (NHKV, (s.ctx + 255) // 256), (256,), (s.Kq[kvi], s.Kd[kvi], s.qq, s.qd, s.sbuf, n(),
-                                                                       i32(NHKV), i32(s.G)))
+            P.add(*s.scores_kernel(), (s.Kq[kvi], s.Kd[kvi], s.qq, s.qd, s.sbuf, n(), i32(NHKV), i32(s.G)))
             P.add(K.k_softmax_rows, (NH,), (256,), (s.sbuf, n()))
             P.add(K.k_attn_vq8w, (NHKV, 1, (s.ctx + 255) // 256), (128,), (s.sbuf, s.Vq[kvi], s.Vd[kvi], s.apart, n(),
                                                                           i32(NH), i32(NHKV), i32(s.G)))

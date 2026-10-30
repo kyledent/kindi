@@ -1526,6 +1526,91 @@ extern "C" __global__ void __launch_bounds__(256) k_attn_sq8t(const uint4* __res
   for(int j = 0; j < 8; ++j) if(j < G) s[(long long)(kv * G + j) * n + t] = acc[j] * 0.0625f;
 }
 
+template<int NP> __device__ __forceinline__ void attn_sq8p(const uint4* __restrict__ Kq,
+    const unsigned short* __restrict__ Kd, const signed char* __restrict__ qq, const float* __restrict__ qd,
+    float* __restrict__ s, int n, int n_kv, int G){
+  /* k_attn_sq8t with two threads per position, NP positions per pair: thread h (0, 1) of a pair reads the 16-byte
+     half h of each 32-value block, so a warp's load is 16 whole 32-byte sectors (a thread per position reads half
+     sectors 1 KB apart, the K rows of the other K/V heads in between: 63 GB/s on the GTX TITAN X at 60K positions),
+     and each query value read from shared memory serves NP positions. Each half block sum is an exact integer, the
+     pair adds them with one shuffle, and the block scale and the in-order sum of the 8 blocks are k_attn_sq8t's:
+     the scores are bit-identical. Grid (NHKV, ceil(ctx / (128 NP))), block 256: pair p takes positions
+     base + p + 128 i. The positions past the last one read the last row and write nothing (every lane stays active
+     for the shuffles). */
+  if((int)blockIdx.y * 128 * NP >= n) return;
+  __shared__ float4 q4[8 * 64];
+  __shared__ float dq[8 * 8];
+  const int kv = blockIdx.x, tid = threadIdx.x, h = tid & 1, t0 = blockIdx.y * 128 * NP + (tid >> 1);
+  float* qf = (float*)q4;
+  for(int i = tid; i < G * 256; i += 256) qf[i] = (float)qq[kv * G * 256 + i];
+  for(int i = tid; i < G * 8; i += 256) dq[i] = qd[kv * G * 8 + i];
+  __syncthreads();
+  const uint4* row[NP];
+  const unsigned short* drow[NP];
+#pragma unroll
+  for(int i = 0; i < NP; ++i){
+    const int tr = min(t0 + 128 * i, n - 1);
+    row[i] = Kq + ((long long)tr * n_kv + kv) * 16 + h;
+    drow[i] = Kd + ((long long)tr * n_kv + kv) * 8;
+  }
+  float acc[NP][8];
+#pragma unroll
+  for(int i = 0; i < NP; ++i)
+#pragma unroll
+    for(int j = 0; j < 8; ++j) acc[i][j] = 0.f;
+#pragma unroll 2
+  for(int b = 0; b < 8; ++b){
+    float kf[NP][16], dk[NP];
+#pragma unroll
+    for(int i = 0; i < NP; ++i){
+      dk[i] = h2f(KLDG(&drow[i][b]));
+      const uint4 w = KLDG(&row[i][b * 2]);
+      const unsigned int ww[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+      for(int c = 0; c < 4; ++c)
+#pragma unroll
+        for(int k = 0; k < 4; ++k) kf[i][c * 4 + k] = sb2f(ww[c] >> (8 * k));
+    }
+#pragma unroll
+    for(int j = 0; j < 8; ++j){
+      float p[NP];
+#pragma unroll
+      for(int i = 0; i < NP; ++i) p[i] = 0.f;
+      if(j < G){
+#pragma unroll
+        for(int e = 0; e < 4; ++e){
+          const float4 q = q4[j * 64 + b * 8 + h * 4 + e];
+#pragma unroll
+          for(int i = 0; i < NP; ++i){
+            p[i] += kf[i][e * 4] * q.x; p[i] += kf[i][e * 4 + 1] * q.y;
+            p[i] += kf[i][e * 4 + 2] * q.z; p[i] += kf[i][e * 4 + 3] * q.w;
+          }
+        }
+      }
+#pragma unroll
+      for(int i = 0; i < NP; ++i){
+        const float part = p[i] + __shfl_xor(p[i], 1);
+        if(j < G) acc[i][j] += part * (dq[j * 8 + b] * dk[i]);
+      }
+    }
+  }
+  if(h) return;
+#pragma unroll
+  for(int i = 0; i < NP; ++i){
+    const int t = t0 + 128 * i;
+    if(t < n)
+#pragma unroll
+      for(int j = 0; j < 8; ++j) if(j < G) s[(long long)(kv * G + j) * n + t] = acc[i][j] * 0.0625f;
+  }
+}
+
+extern "C" __global__ void __launch_bounds__(256) k_attn_sq8p(const uint4* __restrict__ Kq,
+    const unsigned short* __restrict__ Kd, const signed char* __restrict__ qq, const float* __restrict__ qd,
+    float* __restrict__ s, int n, int n_kv, int G){
+  /* two positions per pair: on the GTX TITAN X 2.4x k_attn_sq8t's speed at 60K positions (one: 1.9x; four spill) */
+  attn_sq8p<2>(Kq, Kd, qq, qd, s, n, n_kv, G);
+}
+
 extern "C" __global__ void k_attn_vq8u(const float* __restrict__ s, const unsigned short* __restrict__ Vq2,
                                        const unsigned short* __restrict__ Vd, float* __restrict__ part,
                                        int n, int nheads, int n_kv, int G){
