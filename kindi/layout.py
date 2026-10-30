@@ -15,18 +15,18 @@ def _base_row(lane):
     return (lane & 1) * 8 + ((lane >> 1) & 1) * 4 + ((lane >> 2) & 1) * 2
 
 
-def scales16(Sm):
-    """Sm: [R, P] uint16 (fp16 bits) -> the GEMV scale layout, flat [R/16 * NPH * 32 * 2]."""
+def scales16(Sm, xp=np):
+    """Sm: [R, P] uint16 (fp16 bits) -> the GEMV scale layout, flat [R/16 * NPH * 32 * 2]. xp: numpy or cupy."""
     R, P = Sm.shape
     NPH = P // 4
-    lanes = np.arange(32)
-    rows = np.array([_base_row(l) for l in lanes])
+    lanes = xp.arange(32)
+    rows = xp.asarray([_base_row(l) for l in range(32)])
     grp = lanes >> 3
-    g16 = np.arange(R // 16)[:, None, None, None]
-    ph = np.arange(NPH)[None, :, None, None]
-    r = g16 * 16 + rows[None, None, :, None] + np.arange(2)[None, None, None, :]
+    g16 = xp.arange(R // 16)[:, None, None, None]
+    ph = xp.arange(NPH)[None, :, None, None]
+    r = g16 * 16 + rows[None, None, :, None] + xp.arange(2)[None, None, None, :]
     p = ph * 4 + grp[None, None, :, None]
-    return np.ascontiguousarray(Sm[r, p]).reshape(-1)
+    return xp.ascontiguousarray(Sm[r, p]).reshape(-1)
 
 
 def repack(bi, bc, dp):
@@ -46,6 +46,18 @@ def repack(bi, bc, dp):
         dp[d:d + P * R] = scales16(np.ascontiguousarray(dp[d:d + P * R].reshape(P, R).T))
         done[name] = (R, C)
     return done
+
+
+def gemv_rows(B, S, xp=np):
+    """repack() of one tensor's rows: B [C/4, R] uint8 and S [C/128, R] uint16 in the pack layout (R a multiple of
+    16) -> (weights, scales) in the GEMV layout, flat. Both layouts keep each 16-row group contiguous, so a tensor can
+    be repacked in blocks of rows, each block's output going to offset r0 * C/4 (weights) and r0 * C/128 (scales).
+    xp: numpy or cupy (the 2-bit load repacks on the card)."""
+    ns, R = B.shape
+    C, P = ns * 4, S.shape[0]
+    w = B.T.reshape(R // 4, 4, ns // 4, 4).transpose(0, 2, 1, 3)
+    w = w.reshape(R // 16, 4, C // 512, 32, 4, 4).transpose(0, 2, 1, 3, 4, 5)
+    return xp.ascontiguousarray(w).reshape(-1), scales16(xp.ascontiguousarray(S.T), xp)
 
 
 def reorder_head(bi, bc, dp, clusters, name="token_embd.weight"):

@@ -141,6 +141,19 @@ def _stream_to_card(path, chunk=1 << 26):
     return out
 
 
+def _read_at(f, off, n, dtype):
+    """n items of dtype at byte offset off of the unbuffered file f, read in 64 MB pieces"""
+    a = np.empty(n, dtype=dtype)
+    mv, o = memoryview(a.view(np.uint8)), 0
+    f.seek(off)
+    while o < a.nbytes:
+        k = f.readinto(mv[o:o + (64 << 20)])
+        if not k:
+            raise IOError("kindi: %s ends at byte %d (%d bytes wanted)" % (f.name, off + o, a.nbytes))
+        o += k
+    return a
+
+
 def _ranges(*rs):
     return np.concatenate([np.arange(a, b) for a, b in rs]).astype(np.int64)
 
@@ -286,115 +299,9 @@ class Shard(object):
         t0 = time.time()
         tern, flt = self._slices()
         if self.g5:
-            key = "%s-w%d-c%d" % ((tp.man.get("source_sha256") or "pack")[:12], tp.W, self.card)
-            if os.path.exists(os.path.join(tp.pack, "g5_%s.json" % key)):
-                tern_load = {}                    # cached 5-trit weights: no slices to read
-            else:
-                tern_load = tern
+            self._load_g5(tern)
         else:
-            tern_load = tern
-        bparts, dparts, bi = [], [], {}
-        bo = do = 0
-        if not self.g5:
-            # the 2-bit weights of this card, written straight into one array each: one host copy (the parts and their
-            # concatenation held two - ~7 GB per card for the 27B - and stalled a 15 GB host without swap)
-            nb = nd = 0
-            for name, (rows, cols) in tern_load.items():
-                rec = tp.bi[name]
-                r = len(rows) if rows is not None else rec["rows"]
-                c = (cols[1] - cols[0]) if cols is not None else rec["ne0"]
-                nb, nd = nb + c // 4 * r, nd + c // 128 * r
-            hostram.check(nb + 2 * nd, "card %d's weights" % self.card, self.log)
-            bc_all, dp_all = np.empty(nb, dtype=np.uint8), np.empty(nd, dtype=np.uint16)
-        for name, (rows, cols) in tern_load.items():
-            rec = tp.bi[name]
-            R, C = rec["rows"], rec["ne0"]
-            ns, P = C // 4, C // 128
-            B = tp.bcm[rec["bc_off"]:rec["bc_off"] + ns * R].reshape(ns, R)
-            S = tp.dpm[rec["dpm_off"] // 2:rec["dpm_off"] // 2 + P * R].reshape(P, R)
-            if rows is not None:
-                B, S = B[:, rows], S[:, rows]
-            if cols is not None:
-                B, S = B[cols[0] // 4:cols[1] // 4], S[cols[0] // 128:cols[1] // 128]
-            bi[name] = {"bc_off": bo, "dpm_off": do * 2, "rows": B.shape[1], "ne0": B.shape[0] * 4}
-            if self.g5:
-                bparts.append(np.ascontiguousarray(B))
-                dparts.append(np.ascontiguousarray(S))
-            else:
-                np.copyto(bc_all[bo:bo + B.size].reshape(B.shape), B)
-                np.copyto(dp_all[do:do + S.size].reshape(S.shape), S)
-            bo += B.size
-            do += S.size
-        if self.g5:
-            # g5cache: the repacked weights, kept next to the pack (keyed by the pack's source hash and the slice)
-            key = "%s-w%d-c%d" % ((tp.man.get("source_sha256") or "pack")[:12], tp.W, self.card)
-            cpath = os.path.join(tp.pack, "g5_%s.bin" % key)
-            ipath = os.path.join(tp.pack, "g5_%s.json" % key)
-            lpath = os.path.join(tp.pack, "g5n_%s.bin" % key)
-            lane = False
-            if os.path.exists(cpath) and os.path.exists(ipath):
-                offs = {n: tuple(v) for n, v in json.load(open(ipath)).items()}
-                lane = self.g5l and os.path.exists(lpath)
-                if lane and os.environ.get("KINDI_STREAM_LOAD", "1") == "1":
-                    host = None                     # streamed to the card below, 256 MB at a time
-                else:
-                    host = np.fromfile(lpath if lane else cpath, dtype=np.uint32)
-                del bparts, dparts
-            else:
-                blobs, offs, o = [], {}, 0
-                for name, B, S in zip(tern_load, bparts, dparts):
-                    rec = bi[name]
-                    R, C = rec["rows"], rec["ne0"]
-                    blob = g5_blob(B.reshape(C // 4, R), S.reshape(C // 128, R))
-                    offs[name] = (o, R, C)
-                    o += blob.size
-                    blobs.append(blob)
-                del bparts, dparts
-                host = np.concatenate(blobs)
-                del blobs
-                try:
-                    host.tofile(cpath + ".tmp")
-                    os.replace(cpath + ".tmp", cpath)
-                    json.dump(offs, open(ipath, "w"))
-                except OSError as e:
-                    self.log("could not cache the 5-trit weights: %s" % e)
-            if self.g5l and not lane:
-                # 16-row tiles, byte position major: tile m of group g = 28 x 16 bytes, byte p of rows 16m .. 16m+15
-                for n, (o, R, C) in offs.items():
-                    NG = C // 128
-                    v = host[o:o + NG * R * 7].view(np.uint8).reshape(NG, R // 16, 16, 28)
-                    v[...] = v.transpose(0, 1, 3, 2).copy().reshape(NG, R // 16, 16, 28)
-                try:
-                    host.tofile(lpath + ".tmp")
-                    os.replace(lpath + ".tmp", lpath)
-                except OSError as e:
-                    self.log("could not cache the lane-layout weights: %s" % e)
-            if host is None:
-                self.bc = _stream_to_card(lpath)
-            else:
-                self.bc = cp.asarray(host)
-            del host
-            self.dp = cp.zeros(1, dtype=cp.uint16)
-            self.w = {n: ("g5", self.bc[o:], i32(R), i32(C)) for n, (o, R, C) in offs.items()}
-            # row-layout decode weights plus the lane-layout copy for the chunked prompt GEMM (k_mm_g5n needs it):
-            # KINDI_G5_DUAL=1, the default on HIP, where the card's memory is the host's (unified memory)
-            self.wl = None
-            if not self.g5l and os.path.exists(lpath) and \
-                    os.environ.get("KINDI_G5_DUAL", "1" if rt.is_hip else "0") == "1":
-                self.bcl = _stream_to_card(lpath)
-                self.wl = {n: ("g5", self.bcl[o:], i32(R), i32(C)) for n, (o, R, C) in offs.items()}
-        else:
-            bc, dp = bc_all, dp_all
-            del bc_all, dp_all
-            dims = layout.repack(bi, bc, dp)
-            # straight from this host array (cp.asarray stages a numpy array through a pinned copy of the same size:
-            # a second host copy of the card's weights during the upload)
-            self.bc, self.dp = cp.empty(bc.shape, dtype=bc.dtype), cp.empty(dp.shape, dtype=dp.dtype)
-            self.bc.set(bc)
-            self.dp.set(dp)
-            del bc, dp
-            self.w = {n: (self.bc[bi[n]["bc_off"]:], self.dp[bi[n]["dpm_off"] // 2:], i32(R), i32(C))
-                      for n, (R, C) in dims.items()}
+            self._load_2bit(tern)
         # float tensors: the replicated norms, and this card's slices of the GDN gate weights (kept in their source
         # bf16: the pack widened them exactly, the top 16 bits are the bf16 value) and the conv
         self._f = {}
@@ -423,6 +330,131 @@ class Shard(object):
         cp.get_default_pinned_memory_pool().free_all_blocks()
         self.log("card %d: %.2f GB of weights (%.0fs)" % (self.card, (self.bc.nbytes + self.dp.nbytes) / 1e9,
                                                           time.time() - t0))
+
+    def _load_2bit(self, tern):
+        """the 2-bit weights of this card. Each tensor is read with large sequential reads (memory-mapped reads of a
+        pack on a Docker Desktop drive share ran at 34 MB/s, a third of the share's speed), cut to this card's slice,
+        and put into the GEMV layout on the card in blocks of rows (layout.gemv_rows): the host holds one tensor at a
+        time, and the layout costs no host time (the host repack took 30 s for the 27B)."""
+        tp = self.tp
+        bi, nb, nd = {}, 0, 0
+        for name, (rows, cols) in tern.items():
+            rec = tp.bi[name]
+            r = len(rows) if rows is not None else rec["rows"]
+            c = (cols[1] - cols[0]) if cols is not None else rec["ne0"]
+            if r % 16 or c % 512:
+                raise ValueError("tensor %s (%d x %d) does not fit the GEMV layout" % (name, r, c))
+            bi[name] = {"bc_off": nb, "dpm_off": nd * 2, "rows": r, "ne0": c}
+            nb, nd = nb + c // 4 * r, nd + c // 128 * r
+        big = max(tp.bi[n]["rows"] * tp.bi[n]["ne0"] // 4 for n in tern)
+        hostram.check(2 * big, "card %d's weight upload" % self.card, self.log)
+        self.bc, self.dp = cp.empty(nb, dtype=cp.uint8), cp.empty(nd, dtype=cp.uint16)
+        with open(os.path.join(tp.pack, "bcodes.bin"), "rb", buffering=0) as fb, \
+                open(os.path.join(tp.pack, "dpm.bin"), "rb", buffering=0) as fd:
+            for name, (rows, cols) in tern.items():
+                rec, dst = tp.bi[name], bi[name]
+                R, C = rec["rows"], rec["ne0"]
+                c0, c1 = cols if cols is not None else (0, C)
+                # the column slice is a contiguous run of slots (4 columns) and phases (128 columns)
+                B = _read_at(fb, rec["bc_off"] + c0 // 4 * R, (c1 - c0) // 4 * R, np.uint8).reshape(-1, R)
+                S = _read_at(fd, rec["dpm_off"] + c0 // 128 * R * 2, (c1 - c0) // 128 * R, np.uint16).reshape(-1, R)
+                if rows is not None and not (len(rows) == R and (rows == np.arange(R)).all()):
+                    B, S = B[:, rows], S[:, rows]
+                r, ns, P = dst["rows"], dst["ne0"] // 4, dst["ne0"] // 128
+                step = max(16, (64 << 20) // ns // 16 * 16)          # ~64 MB of weights per block
+                for r0 in range(0, r, step):
+                    r1 = min(r, r0 + step)
+                    wb, ws = layout.gemv_rows(cp.asarray(np.ascontiguousarray(B[:, r0:r1])),
+                                              cp.asarray(np.ascontiguousarray(S[:, r0:r1])), cp)
+                    o, d = dst["bc_off"] + r0 * ns, dst["dpm_off"] // 2 + r0 * P
+                    self.bc[o:o + wb.size] = wb
+                    self.dp[d:d + ws.size] = ws
+                del B, S
+        self.w = {n: (self.bc[v["bc_off"]:], self.dp[v["dpm_off"] // 2:], i32(v["rows"]), i32(v["ne0"]))
+                  for n, v in bi.items()}
+
+    def _load_g5(self, tern):
+        """the 5-trit weights of this card: the cached repack next to the pack, or the slices repacked and cached"""
+        tp = self.tp
+        key = "%s-w%d-c%d" % ((tp.man.get("source_sha256") or "pack")[:12], tp.W, self.card)
+        if os.path.exists(os.path.join(tp.pack, "g5_%s.json" % key)):
+            tern_load = {}                    # cached 5-trit weights: no slices to read
+        else:
+            tern_load = tern
+        bparts, dparts, bi = [], [], {}
+        bo = do = 0
+        for name, (rows, cols) in tern_load.items():
+            rec = tp.bi[name]
+            R, C = rec["rows"], rec["ne0"]
+            ns, P = C // 4, C // 128
+            B = tp.bcm[rec["bc_off"]:rec["bc_off"] + ns * R].reshape(ns, R)
+            S = tp.dpm[rec["dpm_off"] // 2:rec["dpm_off"] // 2 + P * R].reshape(P, R)
+            if rows is not None:
+                B, S = B[:, rows], S[:, rows]
+            if cols is not None:
+                B, S = B[cols[0] // 4:cols[1] // 4], S[cols[0] // 128:cols[1] // 128]
+            bi[name] = {"bc_off": bo, "dpm_off": do * 2, "rows": B.shape[1], "ne0": B.shape[0] * 4}
+            bparts.append(np.ascontiguousarray(B))
+            dparts.append(np.ascontiguousarray(S))
+            bo += B.size
+            do += S.size
+        # g5cache: the repacked weights, kept next to the pack (keyed by the pack's source hash and the slice)
+        key = "%s-w%d-c%d" % ((tp.man.get("source_sha256") or "pack")[:12], tp.W, self.card)
+        cpath = os.path.join(tp.pack, "g5_%s.bin" % key)
+        ipath = os.path.join(tp.pack, "g5_%s.json" % key)
+        lpath = os.path.join(tp.pack, "g5n_%s.bin" % key)
+        lane = False
+        if os.path.exists(cpath) and os.path.exists(ipath):
+            offs = {n: tuple(v) for n, v in json.load(open(ipath)).items()}
+            lane = self.g5l and os.path.exists(lpath)
+            if lane and os.environ.get("KINDI_STREAM_LOAD", "1") == "1":
+                host = None                     # streamed to the card below, 256 MB at a time
+            else:
+                host = np.fromfile(lpath if lane else cpath, dtype=np.uint32)
+            del bparts, dparts
+        else:
+            blobs, offs, o = [], {}, 0
+            for name, B, S in zip(tern_load, bparts, dparts):
+                rec = bi[name]
+                R, C = rec["rows"], rec["ne0"]
+                blob = g5_blob(B.reshape(C // 4, R), S.reshape(C // 128, R))
+                offs[name] = (o, R, C)
+                o += blob.size
+                blobs.append(blob)
+            del bparts, dparts
+            host = np.concatenate(blobs)
+            del blobs
+            try:
+                host.tofile(cpath + ".tmp")
+                os.replace(cpath + ".tmp", cpath)
+                json.dump(offs, open(ipath, "w"))
+            except OSError as e:
+                self.log("could not cache the 5-trit weights: %s" % e)
+        if self.g5l and not lane:
+            # 16-row tiles, byte position major: tile m of group g = 28 x 16 bytes, byte p of rows 16m .. 16m+15
+            for n, (o, R, C) in offs.items():
+                NG = C // 128
+                v = host[o:o + NG * R * 7].view(np.uint8).reshape(NG, R // 16, 16, 28)
+                v[...] = v.transpose(0, 1, 3, 2).copy().reshape(NG, R // 16, 16, 28)
+            try:
+                host.tofile(lpath + ".tmp")
+                os.replace(lpath + ".tmp", lpath)
+            except OSError as e:
+                self.log("could not cache the lane-layout weights: %s" % e)
+        if host is None:
+            self.bc = _stream_to_card(lpath)
+        else:
+            self.bc = cp.asarray(host)
+        del host
+        self.dp = cp.zeros(1, dtype=cp.uint16)
+        self.w = {n: ("g5", self.bc[o:], i32(R), i32(C)) for n, (o, R, C) in offs.items()}
+        # row-layout decode weights plus the lane-layout copy for the chunked prompt GEMM (k_mm_g5n needs it):
+        # KINDI_G5_DUAL=1, the default on HIP, where the card's memory is the host's (unified memory)
+        self.wl = None
+        if not self.g5l and os.path.exists(lpath) and \
+                os.environ.get("KINDI_G5_DUAL", "1" if rt.is_hip else "0") == "1":
+            self.bcl = _stream_to_card(lpath)
+            self.wl = {n: ("g5", self.bcl[o:], i32(R), i32(C)) for n, (o, R, C) in offs.items()}
 
     def f(self, name):
         return self._f[name]
