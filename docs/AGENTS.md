@@ -45,7 +45,75 @@ client = OpenAI(base_url="http://localhost:8093/v1", api_key="none", timeout=360
 
 A shorter custom system prompt helps the first turn.
 
-**Chat UIs** (Open WebUI, LibreChat and similar): add an OpenAI connection with the base URL above.
+**Chat UIs** (Open WebUI, LibreChat and similar): add an OpenAI connection with the base URL above. Turn off extra
+background requests, such as title, tag and follow-up generation (in Open WebUI: Admin Panel, Settings, Interface).
+Each one is a new prompt that waits for the GPU.
+
+## Thinking
+
+Two kinds of request turn thinking on. Clients of the Qwen kind send `chat_template_kwargs.enable_thinking`. Clients of
+the OpenAI kind send `reasoning_effort` alone. An explicit `enable_thinking` wins over an effort.
+
+| `reasoning_effort` | Thinking | 27B template effort |
+|---|---|---|
+| `none` | off | |
+| `minimal`, `low` | on | `low` |
+| `medium` | on | `medium` |
+| `high`, `xhigh`, `max` | on | `xhigh` |
+
+The 2B, 4B and 9B templates have no effort, so there it only selects a thinking budget. Kindi also reads
+`reasoning.effort`. The budget comes from the request (`thinking_budget_tokens`), then the server's `thinking_budgets`,
+then its `thinking_budget`: see [CONFIGURATION.md](CONFIGURATION.md). Set a budget for the 27B, which can think for
+thousands of tokens at each step. All of that thinking stays in the context of an agent.
+
+**pi** has both modes. In `models.json`, this sends the level as `reasoning_effort`, and the server's
+`thinking_budgets` sets each level's budget:
+
+```json
+{
+  "compat": {"supportsDeveloperRole": false, "supportsReasoningEffort": true},
+  "models": [{
+    "id": "bonsai2-27b", "reasoning": true,
+    "thinkingLevelMap": {"minimal": null, "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh"}
+  }]
+}
+```
+
+pi offers `xhigh` only when the map names it. `high` and `xhigh` then share the 27B's `xhigh` budget.
+
+## When a prompt is too long
+
+A prompt that does not fit the context gets an HTTP 400, also for a stream, because Kindi counts the prompt before it
+sends anything:
+
+```json
+{"error": {"message": "This model's maximum context length is 24576 tokens. However, your messages resulted in 25000 tokens. Please reduce the length of the messages.",
+           "type": "invalid_request_error", "param": "messages", "code": "context_length_exceeded"}}
+```
+
+This is OpenAI's error, so clients that handle it know what it means. We read how these clients detect it, in their
+source code on 2026-10-30:
+
+| Client | What it looks for |
+|---|---|
+| pi | `maximum context length is N tokens`, `reduce the length of the messages` |
+| opencode | `maximum context length is N tokens`, `context_length_exceeded` |
+| Cline | code `context_length_exceeded`; status 400 with `context length` or `maximum context` |
+| Roo Code | status 400 with `context length` or `maximum context` |
+| LiteLLM (and clients built on it) | `this model's maximum context length is` |
+| Continue CLI | `maximum context length`, `context_length_exceeded` (it does not retry these) |
+
+Only pi was tested against this error, and only its detection: pi's client recognises it as an overflow. Its code
+then compacts the conversation and retries. What the others do after they detect the error depends on the client.
+
+**Compaction takes time on a slow card.** A client's summary request is a new prompt, so Kindi reads all the text to
+be summarised, at 30-60 tokens/s on a TITAN X Maxwell, then reads the summary and the kept messages again. Leave a
+margin that holds a whole run of tool calls, because pi, for one, checks the context size only when a run ends. With
+pi, for a 100K context, in `settings.json`:
+
+```json
+{"compaction": {"enabled": true, "reserveTokens": 24576, "keepRecentTokens": 20000}}
+```
 
 ## What to expect from a 2B model
 

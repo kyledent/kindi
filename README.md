@@ -209,10 +209,12 @@ print(r.choices[0].message.content)
 Kindi supports these request fields: `messages` (system / user / assistant / tool, text content), `tools` and
 `tool_choice` (`"none"` disables tools), and `stream` and `stream_options.include_usage`. It also supports
 `temperature` (0 = greedy), `top_p`, `top_k`, `max_tokens` / `max_completion_tokens`, `stop` and `seed`. It also
-supports `chat_template_kwargs.enable_thinking` (off by default). When thinking is on, the thinking comes back as
-`reasoning_content` (also streamed as `delta.reasoning_content`). `thinking_budget_tokens` caps the thinking. At the
-budget, the server closes the thinking and the model then gives its answer.
-Responses carry OpenAI `usage` (with `prompt_tokens_details.cached_tokens`) and a `timing` block.
+supports `chat_template_kwargs.enable_thinking` (off by default) and OpenAI's `reasoning_effort`, which also turns
+thinking on. When thinking is on, the thinking comes back as `reasoning_content` (also streamed as
+`delta.reasoning_content`). `thinking_budget_tokens` caps the thinking. At the budget, the server closes the thinking
+and the model then gives its answer.
+Responses carry OpenAI `usage` (with `prompt_tokens_details.cached_tokens`) and a `timing` block. A prompt longer than
+the context gets an HTTP 400 with OpenAI's `context_length_exceeded` error, also when the request asks for a stream.
 
 **Tool calls** come back as OpenAI `tool_calls` with `finish_reason: "tool_calls"`; send the results back as
 `role: "tool"` messages.

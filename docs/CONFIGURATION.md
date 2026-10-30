@@ -63,6 +63,12 @@ Set it for clients that can turn thinking on but cannot send a budget, for examp
 `thinkingFormat: "qwen-chat-template"`. Without a budget, the 27B can think until it reaches `max_tokens` and give no
 answer.
 
+`thinking_budgets` sets the budget per effort, for example `low:2048,medium:4096,xhigh:8192`. It is for clients that
+send only a `reasoning_effort`. An effort that is not listed uses `thinking_budget`. A request with no effort uses the
+server's `reasoning_effort`; on the 27B, if that is empty too, the budget for `xhigh`. A request's own
+`thinking_budget_tokens` wins over both. The budget counts towards `max_tokens`, so keep `max_tokens` larger than the
+budget, or no room is left for the answer.
+
 ## Environment variables for the engine
 
 These variables have no config key. Use them to test or to compare.

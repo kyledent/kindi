@@ -31,6 +31,7 @@ DEFAULTS = {
     "repeat_stop": "0",                 # 1: stop a reply caught in a repeating loop (close it while thinking)
     "reasoning_effort": "",             # 27B template: xhigh | medium | low (empty: the template default, xhigh)
     "thinking_budget": "0",             # thinking tokens before the server closes the thinking (0: no limit); a request's thinking_budget_tokens wins
+    "thinking_budgets": "",             # per effort, e.g. low:2048,medium:4096,xhigh:8192 (an effort not listed: thinking_budget)
     # generation defaults (a request's own values win)
     "max_tokens": "1024",
     "temperature": "0.7",
@@ -114,5 +115,14 @@ def load(explicit=None, overrides=None):
             cfg["model_name"] = "bonsai2-%sb" % (size.group(1) if size else "2")
     if cfg["head"] not in ("exact", "fast"):
         raise SystemExit("kindi: head must be exact or fast, not %r" % cfg["head"])
+    budgets = {}
+    for item in cfg["thinking_budgets"].replace(" ", "").split(","):
+        m = re.match(r"(xhigh|medium|low):(\d+)$", item)
+        if item and not m:
+            raise SystemExit("kindi: thinking_budgets takes effort:tokens pairs (efforts xhigh, medium, low), not %r"
+                             % item)
+        if m:
+            budgets[m.group(1)] = int(m.group(2))
+    cfg["thinking_budgets"] = budgets
     cfg["source"] = source or "(built-in defaults)"
     return cfg

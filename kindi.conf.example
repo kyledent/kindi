@@ -30,3 +30,5 @@ top_p = 0.8
 top_k = 20
 # thinking tokens before the server closes the thinking (0 = no limit); for clients that cannot send one
 thinking_budget = 0
+# the same per effort (xhigh, medium, low), for clients that send only an effort; for example low:2048,medium:4096,xhigh:8192
+thinking_budgets =

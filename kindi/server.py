@@ -1,4 +1,4 @@
-"""Kindi OpenAI-compatible server.\n\n  GET  /health                 status, live progress of the request being served, GPU memory\n  GET  /v1/models              the model\n  POST /v1/chat/completions    messages (+ tools) -> answer; stream=true for SSE; tool calls as OpenAI tool_calls\n\nOne request at a time (one engine on one GPU); concurrent requests queue. Thinking is off unless the request sets\nchat_template_kwargs.enable_thinking (or top-level enable_thinking); a stream then carries the thinking as\ndelta.reasoning_content. thinking_budget_tokens (or thinking_budget) caps it: at the budget the server closes the\nthinking itself and the model goes on to answer. temperature 0 = greedy (token-exact with llama.cpp in the exact head\nmode)."""
+"""Kindi OpenAI-compatible server.\n\n  GET  /health                 status, live progress of the request being served, GPU memory\n  GET  /v1/models              the model\n  POST /v1/chat/completions    messages (+ tools) -> answer; stream=true for SSE; tool calls as OpenAI tool_calls\n\nOne request at a time (one engine on one GPU); concurrent requests queue. Thinking is off unless the request sets\nchat_template_kwargs.enable_thinking (or top-level enable_thinking), or an OpenAI-style reasoning_effort other than\n"none" (high means the 27B's xhigh); a stream then carries the thinking as delta.reasoning_content.\nthinking_budget_tokens (or thinking_budget) caps it, or else the server's budget for the effort: at the budget the\nserver closes the thinking itself and the model goes on to answer. A prompt longer than the context gets an HTTP\n400 with OpenAI's context_length_exceeded error, before a stream starts. temperature 0 = greedy (token-exact with llama.cpp in the exact head\nmode)."""
 import asyncio
 import codecs
 import concurrent.futures
@@ -17,6 +17,48 @@ from .sampling import Sampler
 
 
 THINK_CLOSE = "\n\nI have thought enough; time to act.\n</think>\n\n"
+
+# OpenAI-style reasoning_effort values -> the 27B template's xhigh, medium and low (the templates of the 2B, 4B and 9B
+# have no effort; there it picks only the thinking budget)
+EFFORTS = {"minimal": "low", "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh"}
+
+
+def thinking_of(req, cfg):
+    """(thinking on, effort) for a request. enable_thinking (in chat_template_kwargs or at the top level) is the
+    switch. A request without it turns thinking on with an effort, as OpenAI-style clients do: reasoning_effort,
+    chat_template_kwargs.reasoning_effort or reasoning.effort ("none" leaves thinking off). Without an effort of its
+    own, a request gets the server's reasoning_effort."""
+    kw = req.get("chat_template_kwargs") or {}
+    r = req.get("reasoning")
+    raw = req.get("reasoning_effort") or kw.get("reasoning_effort") or (r.get("effort") if isinstance(r, dict) else None)
+    raw = str(raw).strip().lower() if raw else None
+    if kw.get("enable_thinking") is not None:
+        think = bool(kw["enable_thinking"])
+    elif req.get("enable_thinking") is not None:
+        think = bool(req["enable_thinking"])
+    else:
+        think = raw not in (None, "none")
+    if raw in (None, "none"):
+        raw = (cfg.get("reasoning_effort") or "").strip().lower() or None
+    return think, EFFORTS.get(raw, raw)
+
+
+def thinking_budget(req, cfg, think, effort):
+    """the thinking budget of a request (0: no limit): its own thinking_budget_tokens, then the server's budget for
+    its effort (thinking_budgets), then the server's thinking_budget"""
+    if not think:
+        return 0
+    own = req.get("thinking_budget_tokens") or req.get("thinking_budget")
+    if own:
+        return int(own)
+    return int((cfg.get("thinking_budgets") or {}).get(effort, cfg.get("thinking_budget") or 0))
+
+
+def overflow(n, ctx):
+    """a prompt longer than the context, in OpenAI's words: clients match them to compact the conversation and retry
+    (pi, LiteLLM and others look for "maximum context length is N tokens" or "reduce the length of the messages")"""
+    return OverflowError("This model's maximum context length is %d tokens. However, your messages resulted in %d "
+                         "tokens. Please reduce the length of the messages." % (ctx, n))
 
 
 def _looping(gen, min_span=240):
@@ -133,23 +175,30 @@ class Kindi(object):
                 return Sampler._pick(cand,sc,temperature,top_p,top_k,rng)
         return int(self.cp.argmax(logits).item())
 
-    def _generate_gemma(self,req,cancel=None):
+    def _prepare_gemma(self,req):
         from .gemma4_chat import render as render_gemma
         from . import gemma4_tools
-        cfg=self.cfg; messages=gemma4_tools.prepare_messages(req.get("messages") or [])
-        self.eng.shortlist=cfg["fast_clusters"] if self.head_mode()=="fast" and self.eng.fast_centroids is not None else 0
+        messages=gemma4_tools.prepare_messages(req.get("messages") or [])
         tools=req.get("tools") or None
         if req.get("tool_choice")=="none": tools=None
         kw=dict(req.get("chat_template_kwargs") or {})
-        kw["enable_thinking"]=bool(kw.get("enable_thinking",req.get("enable_thinking",False)))
+        kw["enable_thinking"]=thinking_of(req,self.cfg)[0]
         kw["conversational_mode"]=bool(kw.get("conversational_mode",False))
         prompt=render_gemma(self.model_path,messages,tools,kw,True)
-        thinking_open=prompt.endswith(gemma4_tools.THINK_OPEN+"thought\n")   # after a tool response, thinking on
-        sorter=gemma4_tools.Stream(thinking_open)
         ids=self.tok.encode(prompt)
         if not ids: raise ValueError("Gemma 4 chat template produced an empty prompt")
         if len(ids)>=self.eng.ctx:
-            raise OverflowError("the Gemma 4 prompt has %d tokens; context is %d"%(len(ids),self.eng.ctx))
+            raise overflow(len(ids),self.eng.ctx)
+        return {"tools":tools,"prompt":prompt,"ids":ids}
+
+    def _generate_gemma(self,req,cancel=None,prep=None):
+        from . import gemma4_tools
+        cfg=self.cfg
+        prep=prep or self._prepare_gemma(req)
+        tools,prompt,ids=prep["tools"],prep["prompt"],prep["ids"]
+        self.eng.shortlist=cfg["fast_clusters"] if self.head_mode()=="fast" and self.eng.fast_centroids is not None else 0
+        thinking_open=prompt.endswith(gemma4_tools.THINK_OPEN+"thought\n")   # after a tool response, thinking on
+        sorter=gemma4_tools.Stream(thinking_open)
         max_new=int(req.get("max_tokens") or req.get("max_completion_tokens") or cfg["max_tokens"])
         max_new=max(1,min(max_new,self.eng.ctx-len(ids)))
         temperature=float(req.get("temperature",cfg["temperature"]))
@@ -268,20 +317,38 @@ class Kindi(object):
           "timing":{"prompt_s":round(prompt_done-started,2),"prompt_new_tokens":len(ids),
                     "gen_s":round(elapsed,2),"gen_tok_s":round(len(generated)/elapsed,2)}}
 
-    def generate(self, req, cancel=None):
-        """Yields ("text", piece) while generating, then ("done", info). cancel: a threading.Event set when the
-        client disconnects (prompt reading and generation stop at the next token)."""
+    def prepare(self, req):
+        """The prompt of a request, rendered and counted; no engine work, so it can run on any thread (the server
+        runs it before a stream starts, to answer a prompt that is too long with an HTTP 400). Raises OverflowError
+        or ValueError."""
         if self.native:
-            yield from self._generate_gemma(req,cancel)
-            return
-        cfg = self.cfg
+            return self._prepare_gemma(req)
         messages = req.get("messages") or []
         tools = req.get("tools") or None
         if req.get("tool_choice") == "none":
             tools = None
-        think = bool((req.get("chat_template_kwargs") or {}).get("enable_thinking", req.get("enable_thinking", False)))
-        budget = req.get("thinking_budget_tokens") or req.get("thinking_budget") or cfg.get("thinking_budget") or 0
-        budget = int(budget) if think else 0
+        think, effort = thinking_of(req, self.cfg)
+        kw = req.get("chat_template_kwargs") or {}
+        body, gp = chat.render(messages, tools, think, variant=self.variant, reasoning_effort=effort,
+                               preserve_thinking=kw.get("preserve_thinking"))
+        Tb = self.tok.encode(body)
+        T = Tb + self.tok.encode(gp)
+        if len(T) + 1 >= self.eng.ctx:
+            raise overflow(len(T) + 1, self.eng.ctx)
+        # no effort: the 27B template's default, xhigh
+        budget = thinking_budget(req, self.cfg, think, effort or ("xhigh" if self.variant == "bonsai27" else None))
+        return {"tools": tools, "think": think, "budget": budget, "T": T, "body_len": len(Tb)}
+
+    def generate(self, req, cancel=None, prep=None):
+        """Yields ("text", piece) while generating, then ("done", info). cancel: a threading.Event set when the
+        client disconnects (prompt reading and generation stop at the next token). prep: prepare(req), if the caller
+        has it already."""
+        if self.native:
+            yield from self._generate_gemma(req,cancel,prep)
+            return
+        cfg = self.cfg
+        prep = prep or self.prepare(req)
+        tools, think, budget, T = prep["tools"], prep["think"], prep["budget"], prep["T"]
         g = lambda k, d: d if req.get(k) is None else req.get(k)  # noqa: E731
         temperature = float(g("temperature", cfg["temperature"]))
         top_p = float(g("top_p", cfg["top_p"]))
@@ -297,15 +364,7 @@ class Kindi(object):
         self.eng.shortlist = cfg["fast_clusters"] if fast else 0
         seed = req.get("seed")
         rng = np.random.RandomState(seed if seed is not None else int(time.time() * 1000) % 2 ** 31)
-        kw = req.get("chat_template_kwargs") or {}
-        effort = req.get("reasoning_effort") or kw.get("reasoning_effort") or cfg.get("reasoning_effort") or None
-        body, gp = chat.render(messages, tools, think, variant=self.variant, reasoning_effort=effort,
-                               preserve_thinking=kw.get("preserve_thinking"))
-        Tb = self.tok.encode(body)
-        T = Tb + self.tok.encode(gp)
         ctx = self.eng.ctx
-        if len(T) + 1 >= ctx:
-            raise OverflowError("the prompt has %d tokens; the context is %d" % (len(T), ctx))
         max_new = max(1, min(max_new, ctx - len(T) - 1))
         t0 = time.time()
         self.busy.update(active=True, phase="matching cache", prompt_tokens=len(T), cached=0, read=0, generated=0,
@@ -314,7 +373,7 @@ class Kindi(object):
         try:
             im_end = 248046                                   # <|im_end|> closes the first message
             opening_end = T.index(im_end) + 1 if im_end in T else len(T)
-            nxt, cached = self.runner.prepare(T, len(Tb), opening_end, cancel)
+            nxt, cached = self.runner.prepare(T, prep["body_len"], opening_end, cancel)
         except Cancelled as e:
             self.busy["active"] = False
             self.log("stopped: %s" % e)
@@ -432,6 +491,9 @@ class Kindi(object):
 # the parked conversations hold the memory. One thread makes one handle, at its first use, as one request did before.
 # (A handle made before the engine would load the cuBLAS code ahead of the context fit and cost small cards context.)
 GPU_THREAD = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="kindi-gpu")
+# Rendering and counting a request's prompt (Kindi.prepare) uses no engine, so it runs here: a request that waits
+# behind another is still answered at once when its prompt is too long.
+PREP_THREAD = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="kindi-prep")
 
 
 def _after_engine_error(K, e):
@@ -469,8 +531,13 @@ def create_app(cfg, log=print):
     model_id = cfg["model_name"]
     app = FastAPI(title="Kindi", version=__version__)
 
-    def _err(code, msg, typ="invalid_request_error"):
-        return JSONResponse({"error": {"message": msg, "type": typ, "code": typ}}, status_code=code)
+    def _err(code, msg, typ="invalid_request_error", err_code=None, param=None):
+        return JSONResponse({"error": {"message": msg, "type": typ, "param": param, "code": err_code or typ}},
+                            status_code=code)
+
+    def _overflow_err(e):
+        """OpenAI's answer to a prompt longer than the context"""
+        return _err(400, str(e), "invalid_request_error", "context_length_exceeded", "messages")
 
     def _auth(request):
         key = cfg["api_key"]
@@ -495,8 +562,10 @@ def create_app(cfg, log=print):
     def models(request: Request):
         if not _auth(request):
             return _err(401, "invalid API key", "authentication_error")
+        # the context under both names in use: context_length (OpenRouter, LM Studio) and max_model_len (vLLM)
         return {"object": "list", "data": [{"id": model_id, "object": "model", "created": int(K.t0),
-                                            "owned_by": "kindi", "context_length": K.eng.ctx}]}
+                                            "owned_by": "kindi", "context_length": K.eng.ctx,
+                                            "max_model_len": K.eng.ctx}]}
 
     @app.post("/v1/chat/completions")
     async def completions(request: Request):
@@ -516,6 +585,16 @@ def create_app(cfg, log=print):
             return "data: " + json.dumps(d, ensure_ascii=False) + "\n\n"
 
         cancel = threading.Event()
+        if not isinstance(req, dict):
+            return _err(400, "the body is not a JSON object")
+        # the prompt is rendered and counted before anything is sent: a prompt that is too long (or a bad request)
+        # gets an HTTP 400, also when the client asked for a stream; clients look for the 400 to compact and retry
+        try:
+            prep = await asyncio.get_event_loop().run_in_executor(PREP_THREAD, K.prepare, req)
+        except OverflowError as e:
+            return _overflow_err(e)
+        except ValueError as e:
+            return _err(400, str(e))
 
         if req.get("stream"):
             def sse():
@@ -523,7 +602,7 @@ def create_app(cfg, log=print):
                     yield chunk({"role": "assistant", "content": ""})
                     held, in_call = "", False
                     try:
-                        for kind, val in K.generate(req, cancel):
+                        for kind, val in K.generate(req, cancel, prep):
                             if kind == "reasoning":
                                 yield chunk({"reasoning_content": val})
                             elif kind == "text":
@@ -554,7 +633,9 @@ def create_app(cfg, log=print):
                                 inc = (req.get("stream_options") or {}).get("include_usage")
                                 yield chunk({}, info["finish"], info["usage"] if inc else None)
                     except OverflowError as e:
-                        yield "data: " + json.dumps({"error": {"message": str(e), "type": "context_length_exceeded"}}) + "\n\n"
+                        yield "data: " + json.dumps({"error": {"message": str(e), "type": "invalid_request_error",
+                                                               "param": "messages",
+                                                               "code": "context_length_exceeded"}}) + "\n\n"
                     except ValueError as e:
                         yield "data: " + json.dumps({"error": {"message": str(e), "type": "invalid_request_error"}}) + "\n\n"
                     except Exception as e:
@@ -595,7 +676,7 @@ def create_app(cfg, log=print):
         def run():
             with K.lock:
                 info = None
-                for kind, val in K.generate(req, cancel):
+                for kind, val in K.generate(req, cancel, prep):
                     if kind == "done":
                         info = val
                 return info
@@ -609,7 +690,7 @@ def create_app(cfg, log=print):
             if info is None:
                 return _err(499, "request cancelled", "cancelled")
         except OverflowError as e:
-            return _err(400, str(e), "context_length_exceeded")
+            return _overflow_err(e)
         except ValueError as e:
             return _err(400, str(e))
         except Exception as e:
