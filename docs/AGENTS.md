@@ -103,8 +103,9 @@ source code on 2026-10-30:
 | LiteLLM (and clients built on it) | `this model's maximum context length is` |
 | Continue CLI | `maximum context length`, `context_length_exceeded` (it does not retry these) |
 
-Only pi was tested against this error, and only its detection: pi's client recognises it as an overflow. Its code
-then compacts the conversation and retries. What the others do after they detect the error depends on the client.
+Only pi was tested against a running server: on this error it compacts the conversation and retries by itself. One-shot
+`pi -p` does not wait for the retry, so use the interactive mode or RPC mode. What the other clients do after they
+detect the error depends on the client.
 
 **Compaction takes time on a slow card.** A client's summary request is a new prompt, so Kindi reads all the text to
 be summarised, at 30-60 tokens/s on a TITAN X Maxwell, then reads the summary and the kept messages again. Leave a
